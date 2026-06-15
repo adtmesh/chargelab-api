@@ -1,0 +1,26 @@
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Data exports (may contain PII — driver IDs, session data)
+data/*.csv
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
