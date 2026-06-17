@@ -125,13 +125,12 @@ def parse_month(s: str) -> str | None:
         return None
 
 
-def session_month(row: dict) -> str | None:
-    """Extract YYYY-MM from a ChargeLab session row."""
+def session_start_dt(row: dict) -> datetime | None:
     ts = row.get("Session start date/time (YYYY-MM-DD hh:mm:ss) (local)", "").strip()
     if not ts:
         return None
     try:
-        return datetime.strptime(ts[:7], "%Y-%m").strftime("%Y-%m")
+        return datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return None
 
@@ -142,72 +141,126 @@ def session_month(row: dict) -> str | None:
 
 def build_monthly(bills, monthly_usage, sessions) -> list[dict]:
     """
-    Join bill data, building usage, and EV session kWh by month.
-    Returns a list of dicts sorted by month.
+    Join bill data, building usage, and EV session kWh by billing period.
+
+    Sessions are matched to billing periods by date (not calendar month) so
+    a bill covering May 12–June 9 correctly captures June sessions.
+
+    For billing periods before charger installation (no actual EV data), we
+    estimate EV kWh using the average kWh/session from the periods we do have
+    data for, scaled by the ratio of that period's building kWh to the baseline.
     """
-    # Bills keyed by period_start month (YYYY-MM)
-    bill_by_month: dict[str, dict] = {}
+    # Parse bill periods with full date range for joining
+    bill_periods: list[dict] = []
     for b in bills:
-        ps = b.get("period_start", "")
-        if not ps:
+        ps, pe = b.get("period_start", ""), b.get("period_end", "")
+        if not ps or not pe:
             continue
         try:
-            key = datetime.strptime(ps, "%m/%d/%y").strftime("%Y-%m")
+            start = datetime.strptime(ps, "%m/%d/%y")
+            end   = datetime.strptime(pe, "%m/%d/%y")
+            key   = start.strftime("%Y-%m")
+            bill_periods.append({**b, "_start": start, "_end": end, "_key": key})
         except ValueError:
             continue
-        bill_by_month[key] = b
+    bill_periods.sort(key=lambda b: b["_start"])
 
-    # Building usage keyed by YYYY-MM
+    # Building usage keyed by YYYY-MM (calendar month)
     usage_by_month: dict[str, dict] = {}
     for u in monthly_usage:
         key = parse_month(u["month"])
         if key:
             usage_by_month[key] = u
 
-    # EV kWh per month
-    ev_kwh_by_month: dict[str, float] = defaultdict(float)
-    ev_sessions_by_month: dict[str, int] = defaultdict(int)
+    # Map each session to the billing period it falls in
+    ev_kwh_by_key: dict[str, float] = defaultdict(float)
+    ev_sessions_by_key: dict[str, int] = defaultdict(int)
     for s in sessions:
-        m = session_month(s)
-        if not m:
+        dt = session_start_dt(s)
+        if not dt:
             continue
         try:
             kwh = float(s.get("Session energy provided (kWh)", "0") or 0)
         except ValueError:
             kwh = 0.0
-        ev_kwh_by_month[m] += kwh
-        ev_sessions_by_month[m] += 1
+        for bp in bill_periods:
+            if bp["_start"] <= dt <= bp["_end"]:
+                ev_kwh_by_key[bp["_key"]] += kwh
+                ev_sessions_by_key[bp["_key"]] += 1
+                break
 
-    all_months = sorted(set(bill_by_month) | set(usage_by_month) | set(ev_kwh_by_month))
+    # Compute avg kWh/session from periods with real EV data
+    measured_keys = {k for k, v in ev_kwh_by_key.items() if v > 0}
+    if measured_keys:
+        avg_kwh_per_session = sum(ev_kwh_by_key[k] for k in measured_keys) / sum(ev_sessions_by_key[k] for k in measured_keys)
+        # Use the most data-rich measured period as the baseline for estimation
+        baseline_key = max(measured_keys, key=lambda k: ev_sessions_by_key[k])
+        baseline_sessions = ev_sessions_by_key[baseline_key]
+    else:
+        avg_kwh_per_session = 20.0   # industry average L2 session
+        baseline_key = None
+        baseline_sessions = 0
+
+    # Build one row per billing period
+    bill_keys = {bp["_key"]: bp for bp in bill_periods}
+    all_keys = sorted(set(bill_keys) | set(usage_by_month))
+
+    # Baseline building kWh (from the measured billing period) for proportional estimation
+    baseline_building_kwh = float(bill_keys[baseline_key].get("total_kwh", 0) or 0) if baseline_key else 0.0
 
     result = []
-    for m in all_months:
-        b = bill_by_month.get(m, {})
-        u = usage_by_month.get(m, {})
-        ev_kwh = ev_kwh_by_month.get(m, 0.0)
-        sessions_count = ev_sessions_by_month.get(m, 0)
+    for key in all_keys:
+        bp = bill_keys.get(key, {})
+        # Usage CSV is by calendar month — use the period_start month to look it up
+        u = usage_by_month.get(key, {})
+        ev_kwh_actual = ev_kwh_by_key.get(key, 0.0)
+        sessions_count = ev_sessions_by_key.get(key, 0)
 
-        building_kwh = u.get("kwh", 0.0) or float(b.get("total_kwh", 0) or 0)
-        peak_kw = u.get("actual_kw", 0.0)
-        electric_total = float(b.get("electric_total", 0) or 0)
-        cost_per_kwh = float(b.get("cost_per_kwh", 0) or 0)
+        building_kwh = u.get("kwh", 0.0) or float(bp.get("total_kwh", 0) or 0)
+        peak_kw      = u.get("actual_kw", 0.0)
+        electric_total = float(bp.get("electric_total", 0) or 0)
+        cost_per_kwh   = float(bp.get("cost_per_kwh", 0) or 0)
+
+        # Estimate EV kWh for periods before charger installation
+        # Scale by building kWh ratio: if this period had similar usage, assume similar session count
+        is_estimated = ev_kwh_actual == 0 and building_kwh > 0
+        if is_estimated and baseline_building_kwh > 0 and baseline_sessions > 0:
+            ratio = building_kwh / baseline_building_kwh
+            estimated_sessions = max(1, round(baseline_sessions * ratio))
+            ev_kwh = estimated_sessions * avg_kwh_per_session
+        else:
+            ev_kwh = ev_kwh_actual
+            estimated_sessions = 0
 
         ev_share_pct = (ev_kwh / building_kwh * 100) if building_kwh > 0 else 0.0
         ev_cost = ev_kwh * cost_per_kwh if cost_per_kwh > 0 else 0.0
+        displayed_sessions = sessions_count if sessions_count > 0 else estimated_sessions
+
+        # Label: use period_start date if available, else key
+        if bp.get("_start"):
+            label = bp["_start"].strftime("%b %Y")
+        else:
+            try:
+                label = datetime.strptime(key, "%Y-%m").strftime("%b %Y")
+            except ValueError:
+                label = key
 
         result.append({
-            "month": m,
-            "label": datetime.strptime(m, "%Y-%m").strftime("%b %Y"),
+            "month": key,
+            "label": label,
+            "period": f"{bp.get('period_start','')} – {bp.get('period_end','')}",
             "building_kwh": building_kwh,
             "ev_kwh": ev_kwh,
+            "ev_kwh_actual": ev_kwh_actual,
+            "is_estimated": is_estimated,
             "other_kwh": max(building_kwh - ev_kwh, 0),
             "ev_share_pct": ev_share_pct,
             "peak_kw": peak_kw,
             "electric_total": electric_total,
             "cost_per_kwh": cost_per_kwh,
             "ev_cost": ev_cost,
-            "sessions": sessions_count,
-            "ev_cost_per_session": ev_cost / sessions_count if sessions_count > 0 else 0.0,
+            "sessions": displayed_sessions,
+            "ev_cost_per_session": ev_cost / displayed_sessions if displayed_sessions > 0 else 0.0,
         })
 
     return result
@@ -296,6 +349,7 @@ st.divider()
 # ---------------------------------------------------------------------------
 
 st.subheader("Monthly Energy: Building vs EV Chargers")
+st.caption("🟢 Actual EV data from ChargeLab CSV · 🟡 Estimated (projected from actual avg kWh/session, scaled by building load ratio)")
 
 fig = make_subplots(specs=[[{"secondary_y": True}]])
 
@@ -307,10 +361,18 @@ fig.add_trace(go.Bar(
 ), secondary_y=False)
 
 fig.add_trace(go.Bar(
-    name="EV charger load",
+    name="EV load (actual)",
     x=labels,
-    y=[m["ev_kwh"] for m in months_with_data],
+    y=[m["ev_kwh"] if not m["is_estimated"] else 0 for m in months_with_data],
     marker_color="#22c55e",
+), secondary_y=False)
+
+fig.add_trace(go.Bar(
+    name="EV load (estimated)",
+    x=labels,
+    y=[m["ev_kwh"] if m["is_estimated"] else 0 for m in months_with_data],
+    marker_color="#fcd34d",
+    marker_pattern_shape="/",
 ), secondary_y=False)
 
 fig.add_trace(go.Scatter(
@@ -324,9 +386,9 @@ fig.add_trace(go.Scatter(
 
 fig.update_layout(
     barmode="stack",
-    height=400,
+    height=420,
     legend=dict(orientation="h", yanchor="bottom", y=1.02),
-    margin=dict(t=40),
+    margin=dict(t=50),
 )
 fig.update_yaxes(title_text="kWh", secondary_y=False)
 fig.update_yaxes(title_text="EV share (%)", secondary_y=True, range=[0, 30])
@@ -421,10 +483,11 @@ table_rows = []
 for m in months_with_data:
     table_rows.append({
         "Month": m["label"],
+        "Period": m["period"],
         "Building kWh": f"{m['building_kwh']:,.0f}",
-        "EV kWh": f"{m['ev_kwh']:,.1f}",
+        "EV kWh": f"{m['ev_kwh']:,.1f}" + (" *" if m["is_estimated"] else ""),
         "EV Share": f"{m['ev_share_pct']:.1f}%",
-        "Sessions": m["sessions"],
+        "Sessions": f"{m['sessions']}" + (" *" if m["is_estimated"] else ""),
         "Avg kWh/session": f"{m['ev_kwh']/m['sessions']:.1f}" if m["sessions"] > 0 else "—",
         "$/kWh (bill)": f"${m['cost_per_kwh']:.4f}" if m["cost_per_kwh"] > 0 else "—",
         "Est. EV Cost": f"${m['ev_cost']:.2f}" if m["ev_cost"] > 0 else "—",
@@ -432,6 +495,7 @@ for m in months_with_data:
         "Peak kW": f"{m['peak_kw']:.1f}" if m["peak_kw"] > 0 else "—",
     })
 
+st.caption("\\* Estimated — projected from actual avg kWh/session scaled by building load ratio.")
 st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------------------------
