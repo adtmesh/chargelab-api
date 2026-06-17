@@ -18,6 +18,7 @@ __pycache__/
 # Data exports (may contain PII — driver IDs, session data)
 data/*.csv
 data/seen_failures.json
+data/csu_bills_summary.csv
 
 # macOS
 .DS_Store
